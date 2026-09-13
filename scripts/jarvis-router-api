@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+Very small HTTP wrapper around /usr/local/bin/jarvis-route.
+
+Endpoints
+---------
+GET /health
+    No authentication.
+    Used by the Home Assistant config flow to check connectivity.
+
+POST /route
+    Requires:
+        Authorization: Bearer <ROUTER_API_KEY>
+
+    JSON body:
+        {"text": "user utterance"}
+
+    JSON response:
+        {"speech": "final spoken response"}
+
+Why use a wrapper?
+------------------
+The Home Assistant custom conversation component needs a network API.
+Keeping the routing logic in a CLI script makes it easy to test without HA.
+
+This server uses only Python's standard library.
+"""
+
+import json
+import os
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+HOST = "0.0.0.0"
+PORT = 8099
+ROUTER_COMMAND = "/usr/local/bin/jarvis-route"
+
+ROUTER_API_KEY = os.environ.get("ROUTER_API_KEY")
+
+if not ROUTER_API_KEY:
+    raise RuntimeError("ROUTER_API_KEY is not set")
+
+
+class Handler(BaseHTTPRequestHandler):
+    """Handle Jarvis API requests."""
+
+    # Keep normal HTTP request logging quiet. Routing itself is logged by
+    # jarvis-route in /var/log/jarvis-router.log.
+    def log_message(self, format, *args):
+        return
+
+    def send_json(self, status_code, payload):
+        """Write a JSON response."""
+        body = json.dumps(payload).encode("utf-8")
+
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        """Health endpoint."""
+        if self.path == "/health":
+            self.send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "jarvis-router",
+                },
+            )
+            return
+
+        self.send_json(404, {"error": "not_found"})
+
+    def do_POST(self):
+        """Route an utterance."""
+        if self.path != "/route":
+            self.send_json(404, {"error": "not_found"})
+            return
+
+        auth = self.headers.get("Authorization", "")
+        expected = f"Bearer {ROUTER_API_KEY}"
+
+        if auth != expected:
+            self.send_json(401, {"error": "unauthorized"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(length)
+            payload = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            self.send_json(400, {"error": "invalid_json"})
+            return
+
+        text = payload.get("text")
+
+        if not isinstance(text, str) or not text.strip():
+            self.send_json(400, {"error": "text_required"})
+            return
+
+        try:
+            # List-form subprocess arguments avoid shell interpolation and
+            # quoting issues with arbitrary voice text.
+            completed = subprocess.run(
+                [ROUTER_COMMAND, text.strip()],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self.send_json(504, {"error": "router_timeout"})
+            return
+        except Exception as err:
+            self.send_json(
+                500,
+                {
+                    "error": "router_failed",
+                    "detail": str(err),
+                },
+            )
+            return
+
+        if completed.returncode != 0:
+            self.send_json(
+                500,
+                {
+                    "error": "router_failed",
+                    "detail": completed.stderr.strip(),
+                },
+            )
+            return
+
+        speech = completed.stdout.strip()
+
+        if not speech:
+            self.send_json(
+                500,
+                {"error": "empty_router_response"},
+            )
+            return
+
+        self.send_json(
+            200,
+            {"speech": speech},
+        )
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"Jarvis Router API listening on {HOST}:{PORT}", flush=True)
+    server.serve_forever()

@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+
+"""
+Jarvis L/D/C router.
+
+What this script does
+---------------------
+1. Loads secrets/configuration from /etc/jarvis-router.env.
+2. Sends a tiny classification prompt to Qwen through LiteLLM.
+3. Receives exactly one route label:
+       L = local/general knowledge
+       D = live Home Assistant / household data
+       C = current/external/internet data
+4. If D is requested, checks whether the desktop LLM is eligible.
+5. Selects a Home Assistant conversation agent.
+6. Calls Home Assistant's /api/conversation/process endpoint.
+7. Prints only the final speech and logs the routing decision.
+
+Important architecture note
+---------------------------
+LiteLLM is NOT the high-level semantic router here.
+
+The selected D/C execution path deliberately goes back through Home
+Assistant so HA can attach the selected conversation agent's own:
+- tools;
+- entity exposure;
+- prompt;
+- permissions;
+- web-search settings.
+
+Common customisation points
+---------------------------
+- CLASSIFIER_MODEL
+- DESKTOP_MODEL
+- MIN_FREE_VRAM_MB
+- AGENTS
+- classifier_prompt
+- DESKTOP_GPU_URL / DESKTOP_OLLAMA_PS_URL
+"""
+
+import json
+import os
+import sys
+import urllib.request
+
+
+ENV_FILE = "/etc/jarvis-router.env"
+
+# Local LiteLLM endpoint. The classifier is deliberately local/cheap.
+LITELLM_URL = "http://127.0.0.1:4000/v1/chat/completions"
+CLASSIFIER_MODEL = "qwen-local"
+
+# Desktop resource/health endpoints.
+#
+# /api/ps tells us if the desktop model is already resident.
+# Port 8098 is the small PowerShell nvidia-smi service included in this repo.
+DESKTOP_GPU_URL = "http://192.168.0.50:8098/gpu"
+DESKTOP_OLLAMA_PS_URL = "http://192.168.0.50:11434/api/ps"
+DESKTOP_MODEL = "gpt-oss:20b"
+
+# This is NOT universal.
+# It was derived experimentally for a 16 GB RTX 5070 Ti where:
+# - normal Windows + BlueStacks left ~12.7 GB free;
+# - GPT-OSS consumed ~12.5 GB additional VRAM.
+#
+# Tune this from real measurements on your own machine.
+MIN_FREE_VRAM_MB = 12000
+
+# These are Home Assistant conversation entity IDs.
+#
+# They are NOT LiteLLM aliases.
+#
+# The D and C agents can each have different HA tool/entity exposure.
+AGENTS = {
+    "L": "conversation.qwen_litellm",
+    "D": "conversation.ollama_conversation_desktop",
+    "C": "conversation.openai_conversation",
+}
+
+
+def load_env_file(path):
+    """Load simple KEY=value pairs into the process environment."""
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+def post_json(url, payload, headers, timeout=30):
+    """POST JSON using only Python's standard library."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_json(url, timeout=3):
+    """GET and decode a JSON response."""
+    request = urllib.request.Request(
+        url,
+        method="GET",
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def desktop_model_loaded():
+    """
+    Return True if GPT-OSS is already resident in desktop Ollama.
+
+    Why check this BEFORE free VRAM?
+    --------------------------------
+    Once GPT-OSS loads, it consumes almost all available VRAM. A simple
+    "free VRAM >= threshold" test would then incorrectly reject the next
+    request even though the model is already loaded and ready.
+
+    We therefore consider a resident model immediately eligible.
+    """
+    try:
+        result = get_json(
+            DESKTOP_OLLAMA_PS_URL,
+            timeout=3,
+        )
+
+        for model in result.get("models", []):
+            name = model.get("name", "")
+
+            if name == DESKTOP_MODEL:
+                return True
+
+        return False
+
+    except Exception:
+        # Do not fail the whole router because desktop Ollama is unavailable.
+        # A D request can still fall back to cloud.
+        return False
+
+
+def get_desktop_gpu_status():
+    """
+    Return GPU telemetry dict or None.
+
+    Expected fields:
+      total_mb
+      used_mb
+      free_mb
+      gpu_name
+      utilisation
+
+    This endpoint is supplied by windows/gpu-status.ps1.
+    """
+    try:
+        return get_json(
+            DESKTOP_GPU_URL,
+            timeout=3,
+        )
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Environment / arguments
+# ---------------------------------------------------------------------------
+
+load_env_file(ENV_FILE)
+
+litellm_key = os.environ.get("LITELLM_MASTER_KEY")
+ha_url = os.environ.get("HA_URL")
+ha_token = os.environ.get("HA_TOKEN")
+
+if not litellm_key:
+    raise RuntimeError("LITELLM_MASTER_KEY is not set")
+
+if not ha_url:
+    raise RuntimeError("HA_URL is not set")
+
+if not ha_token:
+    raise RuntimeError("HA_TOKEN is not set")
+
+if len(sys.argv) < 2:
+    print(f'Usage: {sys.argv[0]} "question"')
+    sys.exit(1)
+
+question = " ".join(sys.argv[1:]).strip()
+
+
+# ---------------------------------------------------------------------------
+# 1. CLASSIFY
+# ---------------------------------------------------------------------------
+
+# Keep this prompt small.
+# The classifier's job is only to select capability, not answer the question.
+#
+# If you add a new route, make the labels and definitions mutually clear and
+# update both AGENTS/policy and the validation below.
+classifier_prompt = (
+    "Classify the question. Reply only L, D, or C. "
+    "L = no live data needed. "
+    "D = live data from my Home Assistant, home, devices, sensors, "
+    "rooms, solar or energy. "
+    "C = live data from the internet or outside world. "
+    f"Question: {question}"
+)
+
+classifier_payload = {
+    "model": CLASSIFIER_MODEL,
+    "messages": [
+        {
+            "role": "user",
+            "content": classifier_prompt,
+        }
+    ],
+    "temperature": 0,
+    "max_tokens": 4,
+}
+
+classifier_result = post_json(
+    LITELLM_URL,
+    classifier_payload,
+    {
+        "Authorization": f"Bearer {litellm_key}",
+        "Content-Type": "application/json",
+    },
+    timeout=10,
+)
+
+classification = (
+    classifier_result["choices"][0]["message"]["content"]
+    .strip()
+    .upper()
+)
+
+if classification not in AGENTS:
+    raise RuntimeError(
+        f"Unexpected classifier response: {classification}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. APPLY EXECUTION POLICY
+# ---------------------------------------------------------------------------
+
+route_reason = ""
+free_vram_mb = None
+model_loaded = False
+
+if classification == "L":
+    route = "LOCAL"
+    agent_id = AGENTS["L"]
+    route_reason = "local_knowledge"
+
+elif classification == "C":
+    route = "CLOUD"
+    agent_id = AGENTS["C"]
+    route_reason = "internet_required"
+
+elif classification == "D":
+    # First ask whether the expensive desktop model is already resident.
+    model_loaded = desktop_model_loaded()
+
+    if model_loaded:
+        route = "DESKTOP"
+        agent_id = AGENTS["D"]
+        route_reason = "model_already_loaded"
+
+        # Telemetry here is for logging only. Low free VRAM is normal once the
+        # model itself is resident.
+        gpu = get_desktop_gpu_status()
+
+        if gpu is not None:
+            free_vram_mb = gpu.get("free_mb")
+
+    else:
+        # The model is not resident, so now free VRAM determines whether
+        # loading it is safe enough.
+        gpu = get_desktop_gpu_status()
+
+        if gpu is None:
+            route = "CLOUD"
+            agent_id = AGENTS["C"]
+            route_reason = "desktop_gpu_unreachable"
+
+        else:
+            free_vram_mb = gpu.get("free_mb")
+
+            if (
+                isinstance(free_vram_mb, int)
+                and free_vram_mb >= MIN_FREE_VRAM_MB
+            ):
+                route = "DESKTOP"
+                agent_id = AGENTS["D"]
+                route_reason = "sufficient_free_vram"
+            else:
+                route = "CLOUD"
+                agent_id = AGENTS["C"]
+                route_reason = "insufficient_vram"
+
+
+# ---------------------------------------------------------------------------
+# 3. HAND OFF TO HOME ASSISTANT
+# ---------------------------------------------------------------------------
+
+# This is the architectural "bounce back" into HA.
+#
+# HA now constructs a fresh request using the selected agent_id. That agent
+# owns the correct HA tools/entities/instructions for its tier.
+conversation_payload = {
+    "text": question,
+    "agent_id": agent_id,
+    "language": "en-GB",
+}
+
+conversation_result = post_json(
+    f"{ha_url.rstrip('/')}/api/conversation/process",
+    conversation_payload,
+    {
+        "Authorization": f"Bearer {ha_token}",
+        "Content-Type": "application/json",
+    },
+    timeout=60,
+)
+
+
+# ---------------------------------------------------------------------------
+# 4. EXTRACT SPOKEN RESPONSE
+# ---------------------------------------------------------------------------
+
+try:
+    speech = (
+        conversation_result["response"]["speech"]["plain"]["speech"]
+    )
+except (KeyError, TypeError):
+    raise RuntimeError(
+        "Home Assistant returned no plain speech response:\n"
+        + json.dumps(conversation_result, indent=2)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. LOG DECISION
+# ---------------------------------------------------------------------------
+
+# Logs are intentionally policy-focused so you can answer:
+# "Why did Jarvis choose cloud instead of desktop?"
+log_parts = [
+    f"route={route}",
+    f"classifier={classification}",
+    f"agent={agent_id}",
+    f"reason={route_reason}",
+]
+
+if classification == "D":
+    log_parts.append(
+        f"model_loaded={'yes' if model_loaded else 'no'}"
+    )
+
+    if free_vram_mb is not None:
+        log_parts.append(
+            f"free_vram={free_vram_mb}MB"
+        )
+
+log_parts.append(
+    f'question="{question}"'
+)
+
+try:
+    with open("/var/log/jarvis-router.log", "a", encoding="utf-8") as log:
+        log.write(
+            " ".join(log_parts) + "\n"
+        )
+except Exception:
+    # Logging should never prevent voice from working.
+    pass
+
+# The API wrapper expects stdout to contain only the final spoken response.
+print(speech)
