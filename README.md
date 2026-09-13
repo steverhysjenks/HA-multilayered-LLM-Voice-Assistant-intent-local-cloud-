@@ -224,7 +224,7 @@ This sequence makes troubleshooting dramatically easier because every boundary h
 ## 6. Fast verification
 
 On the Jarvis/LiteLLM LXC:
-
+Note, for my reference the solar question is unique to my set-up. You want a question that does not require live data (access to cloud) and it not also an intent question (turn something on).
 ```bash
 /usr/local/bin/jarvis-route "Who wrote The Hobbit?"
 /usr/local/bin/jarvis-route "How much solar am I generating now?"
