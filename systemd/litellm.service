@@ -1,0 +1,18 @@
+[Unit]
+Description=LiteLLM Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# If you use an environment file for cloud/provider keys, uncomment:
+# EnvironmentFile=/etc/litellm/environment
+
+ExecStart=/root/.local/bin/litellm --config /etc/litellm/config.yaml --host 0.0.0.0 --port 4000
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Jarvis Voice Router API
+After=network-online.target litellm.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Contains LITELLM_MASTER_KEY, HA_URL, HA_TOKEN and ROUTER_API_KEY.
+EnvironmentFile=/etc/jarvis-router.env
+
+ExecStart=/usr/local/bin/jarvis-router-api
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
