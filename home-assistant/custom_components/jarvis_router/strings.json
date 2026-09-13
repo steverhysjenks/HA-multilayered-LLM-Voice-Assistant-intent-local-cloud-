@@ -1,0 +1,25 @@
+{
+  "title": "Jarvis Router",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Jarvis Router",
+        "description": "Connect Home Assistant to the Jarvis Router service.",
+        "data": {
+          "url": "Router URL",
+          "api_key": "API key"
+        },
+        "data_description": {
+          "url": "For example http://192.168.0.121:8099",
+          "api_key": "The ROUTER_API_KEY configured on the Jarvis/LiteLLM host"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to Jarvis Router"
+    },
+    "abort": {
+      "already_configured": "Jarvis Router is already configured"
+    }
+  }
+}

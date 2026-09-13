@@ -1,0 +1,8 @@
+{
+  "domain": "jarvis_router",
+  "name": "Jarvis Router",
+  "version": "1.0.0",
+  "config_flow": true,
+  "integration_type": "service",
+  "iot_class": "local_push"
+}
