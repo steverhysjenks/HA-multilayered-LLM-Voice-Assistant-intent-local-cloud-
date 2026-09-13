@@ -1,0 +1,36 @@
+# LiteLLM proxy model aliases.
+#
+# These aliases are logical names. The Jarvis classifier currently uses
+# qwen-local directly. Desktop/cloud aliases are useful for testing and
+# other clients, even though the production HA handoff returns to HA
+# conversation agents for tool-aware execution.
+
+model_list:
+  - model_name: qwen-local
+    litellm_params:
+      model: ollama/qwen3:4b-instruct-2507-q4_K_M
+      api_base: http://192.168.0.39:11434
+      num_ctx: 8192
+
+  - model_name: llm-desktop
+    litellm_params:
+      model: ollama/gpt-oss:20b
+      api_base: http://192.168.0.50:11434
+      num_ctx: 8192
+
+  # Optional cloud alias.
+  #
+  # The reference production cloud route uses Home Assistant's direct
+  # OpenAI conversation agent because HA owns its tool/web-search options.
+  #
+  # If you keep this alias, load OPENAI_API_KEY from the LiteLLM service
+  # environment rather than writing the secret here.
+  - model_name: llm-cloud
+    litellm_params:
+      model: openai/YOUR_OPENAI_MODEL
+      api_key: os.environ/OPENAI_API_KEY
+
+general_settings:
+  # Prefer an environment variable for production if your deployment
+  # pattern supports it. Do not commit a real master key.
+  master_key: replace-me
