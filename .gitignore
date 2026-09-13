@@ -1,0 +1,17 @@
+# Secrets / local environment
+*.env
+.env
+jarvis-router.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
