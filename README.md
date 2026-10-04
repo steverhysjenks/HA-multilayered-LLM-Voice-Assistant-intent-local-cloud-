@@ -10,6 +10,27 @@ A practical reference implementation for routing Home Assistant voice requests a
 
 This repository documents a working architecture built around Home Assistant Assist, EchoMuse, LiteLLM, Ollama, OpenAI, and a small custom Python router.
 
+### Where this fits in the wider Jarvis platform
+
+This repository remains the **reactive voice-routing layer** of the wider Jarvis platform. It has not been replaced by, deprecated by or merged into Jarvis Core.
+
+Its responsibility remains deliberately focused:
+
+```text
+Voice request
+    ↓
+Home Assistant native intent handling
+    ↓
+Jarvis Router
+    ↓
+jarvis-route
+    ↓
+LOCAL / DESKTOP / CLOUD decision
+    ↓
+Selected Home Assistant conversation agent
+    ↓
+LiteLLM / Ollama / desktop model / cloud model
+
 > The important architectural idea is that **LiteLLM is not the semantic router**.  
 > LiteLLM is an API/model gateway.  
 > `jarvis-route` is the orchestration layer.  
